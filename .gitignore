@@ -1,0 +1,3 @@
+.venv
+api/package
+api/lambda_function.zip
