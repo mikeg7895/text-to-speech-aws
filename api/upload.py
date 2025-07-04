@@ -3,12 +3,17 @@ import base64
 import json
 import uuid
 from datetime import datetime
+import cgi
+from io import BytesIO
 
 s3 = boto3.client('s3')
 bucket_name = 'files-mikeg'
 
 def lambda_handler(event, context):
     try:
+        print(f"Event received: {json.dumps(event, default=str)}")
+        
+        # Get the body
         body = event.get('body', '')
         if not body:
             return {
@@ -17,97 +22,98 @@ def lambda_handler(event, context):
                 'headers': {'Content-Type': 'application/json'}
             }
         
-        if event.get('isBase64Encoded', False):
+        # Handle base64 encoded body - Fixed boolean conversion
+        is_base64_encoded = event.get('isBase64Encoded')
+        if is_base64_encoded is True or (isinstance(is_base64_encoded, str) and is_base64_encoded.lower() == 'true'):
             try:
                 body = base64.b64decode(body)
-                 
+                print("Successfully decoded base64 body")
             except Exception as e:
+                print(f"Failed to decode base64: {e}")
                 return {
                     'statusCode': 400,
                     'body': json.dumps({'error': 'Invalid base64 encoding'}),
                     'headers': {'Content-Type': 'application/json'}
                 }
         else:
-            body = body.encode('utf-8') if isinstance(body, str) else body        
-        headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+            body = body.encode('utf-8') if isinstance(body, str) else body
+        
+        # Get headers with better error handling
+        headers = event.get('headers', {})
+        if not isinstance(headers, dict):
+            headers = {}
+        
+        headers = {k.lower(): v for k, v in headers.items()}
         content_type = headers.get('content-type', '')
-
-        boundary = None
-        if 'multipart/form-data' in content_type:
-            boundary_parts = content_type.split('boundary=')
-            if len(boundary_parts) > 1:
-                boundary = boundary_parts[1].strip().strip('"')
-            else:
-                return {
-                    'statusCode': 400,
-                    'body': json.dumps({'error': 'No boundary found in multipart data'}),
-                    'headers': {'Content-Type': 'application/json'}
-                }
-        else:
+        
+        print(f"Content-Type: {content_type}")
+        print(f"Body length: {len(body)}")
+        
+        # Validate content type
+        if not content_type.startswith('multipart/form-data'):
             return {
                 'statusCode': 400,
-                'body': json.dumps({'error': 'Content-Type must be multipart/form-data'}),
+                'body': json.dumps({'error': f'Content-Type must be multipart/form-data, got: {content_type}'}),
                 'headers': {'Content-Type': 'application/json'}
             }
         
-        body_str = body.decode('utf-8', errors='ignore')
-        parts = body_str.split(f'--{boundary}')
+        # Create file-like object for cgi.FieldStorage
+        fp = BytesIO(body)
         
-        file_data = None
-        filename = None
+        # Create environment for cgi.FieldStorage
+        environ = {
+            'REQUEST_METHOD': 'POST',
+            'CONTENT_TYPE': content_type,
+            'CONTENT_LENGTH': str(len(body)),
+        }
         
-        for part in parts:
-            if 'Content-Disposition' in part and 'filename=' in part:
-                lines = part.split('\r\n')
-                
-                for line in lines:
-                    if 'filename=' in line:
-                        filename_match = line.split('filename=')[1].strip().strip('"')
-                        if filename_match and filename_match != '':
-                            filename = filename_match
-                            break
-                
-                content_start = False
-                file_content_lines = []
-                for line in lines:
-                    if content_start:
-                        file_content_lines.append(line)
-                    elif line.strip() == '':
-                        content_start = True
-                
-                if file_content_lines:
-                    file_data = '\r\n'.join(file_content_lines).rstrip(f'--{boundary}--').rstrip('\r\n')
+        # Parse with cgi.FieldStorage
+        try:
+            form = cgi.FieldStorage(fp=fp, environ=environ)
+        except Exception as e:
+            print(f"Error parsing form data: {e}")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': f'Failed to parse form data: {str(e)}'}),
+                'headers': {'Content-Type': 'application/json'}
+            }
+        
+        # Find the file field
+        file_field = None
+        if hasattr(form, 'list') and form.list:
+            for field in form.list:
+                if hasattr(field, 'filename') and field.filename:
+                    file_field = field
                     break
         
-        if not filename or not file_data:
+        if file_field is None:
             return {
                 'statusCode': 400,
-                'body': json.dumps({
-                    'error': 'No file found or file is empty',
-                    'filename': filename,
-                    'has_data': bool(file_data)
-                }),
+                'body': json.dumps({'error': 'No file found in request'}),
                 'headers': {'Content-Type': 'application/json'}
             }
         
-        allowed_extensions = ['.txt', '.csv', '.json', '.xml', '.log', '.md', '.yaml', '.yml', '.ini', '.cfg', '.conf']
-        file_extension = '.' + filename.split('.')[-1].lower() if '.' in filename else ''
+        # Get file data
+        filename = file_field.filename
+        file_content = file_field.value
         
-        if file_extension not in allowed_extensions:
+        print(f"Original filename: {filename}")
+        print(f"File content length: {len(file_content) if file_content else 0}")
+        
+        # Validate file
+        if not filename or not file_content:
             return {
                 'statusCode': 400,
-                'body': json.dumps({
-                    'error': f'File type not allowed. Allowed types: {", ".join(allowed_extensions)}',
-                    'filename': filename,
-                    'extension': file_extension
-                }),
+                'body': json.dumps({'error': 'File is empty or has no name'}),
                 'headers': {'Content-Type': 'application/json'}
             }
         
+        # Create unique filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         unique_id = str(uuid.uuid4())[:8]
         unique_filename = f"{timestamp}_{unique_id}_{filename}"
         
+        # Determine content type based on file extension
         content_type_map = {
             '.txt': 'text/plain',
             '.csv': 'text/csv',
@@ -119,15 +125,24 @@ def lambda_handler(event, context):
             '.yml': 'application/x-yaml',
             '.ini': 'text/plain',
             '.cfg': 'text/plain',
-            '.conf': 'text/plain'
+            '.conf': 'text/plain',
+            '.pdf': 'application/pdf',
+            '.doc': 'application/msword',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         }
         
-        s3_content_type = content_type_map.get(file_extension, 'text/plain')
+        file_extension = '.' + filename.split('.')[-1].lower() if '.' in filename else ''
+        s3_content_type = content_type_map.get(file_extension, 'application/octet-stream')
         
+        # Handle text files - ensure they're properly encoded
+        if isinstance(file_content, str):
+            file_content = file_content.encode('utf-8')
+        
+        # Upload to S3
         s3.put_object(
             Bucket=bucket_name,
-            Key=unique_filename,
-            Body=file_data.encode('utf-8'),
+            Key=f"files/{unique_filename}",
+            Body=file_content,
             ContentType=s3_content_type,
             Metadata={
                 'original-filename': filename,
@@ -143,8 +158,8 @@ def lambda_handler(event, context):
             'body': json.dumps({
                 'message': 'File uploaded successfully',
                 'original_filename': filename,
-                's3_key': unique_filename,
-                'size': len(file_data),
+                's3_key': f"files/{unique_filename}",
+                'size': len(file_content),
                 'content_type': s3_content_type,
                 'upload_timestamp': timestamp
             }),
@@ -164,11 +179,13 @@ def lambda_handler(event, context):
             'statusCode': 500,
             'body': json.dumps({
                 'error': f'Internal server error: {str(e)}',
-                'type': 'server_error'
+                'type': 'server_error',
+                'details': traceback.format_exc()
             }),
             'headers': {'Content-Type': 'application/json'}
         }
 
+# Handle OPTIONS for CORS
 def handle_options():
     return {
         'statusCode': 200,
@@ -180,8 +197,21 @@ def handle_options():
         }
     }
 
+# Main handler
 def main_handler(event, context):
-    if event.get('httpMethod') == 'OPTIONS':
-        return handle_options()
-    else:
-        return lambda_handler(event, context)
+    try:
+        http_method = event.get('httpMethod', '').upper()
+        if http_method == 'OPTIONS':
+            return handle_options()
+        else:
+            return lambda_handler(event, context)
+    except Exception as e:
+        print(f"Error in main_handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': f'Handler error: {str(e)}',
+                'type': 'handler_error'
+            }),
+            'headers': {'Content-Type': 'application/json'}
+        }

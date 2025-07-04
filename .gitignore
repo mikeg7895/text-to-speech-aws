@@ -1,3 +1,4 @@
 .venv
 api/package
 api/lambda_function.zip
+text-speech/lambda_function.zip
